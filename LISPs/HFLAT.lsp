@@ -15,7 +15,22 @@
 ;;; Geometry (block origin = bottom-left corner of the FRONT face):
 ;;;   X = width, Y = depth (front face at Y=0, frame behind it), Z = height
 ;;;   Layer HFLAT-SKIN  : lauan / plywood skin, one solid per 4x8 sheet
-;;;   Layer HFLAT-FRAME : rails + stiles + toggles (one solid)
+;;;   Layer HFLAT-FRAME : rails, stiles and toggles, each board its own solid
+;;;
+;;; Framing layout:
+;;;   - stiles (and the 2x4 mid-stile) run from the top of the bottom rail
+;;;     to the bottom of the top rail
+;;;   - toggles stop at each vertical board, so a toggle on a flat with a
+;;;     2x4 mid-stile is two separate pieces
+;;;
+;;; Skin layout:
+;;;   - 4x8 sheets run vertically (48" wide, 96" tall) from the bottom left
+;;;   - if the top row would be less than one sheet width (48") tall on a
+;;;     flat wider than one sheet, HFLAT offers to cut that row from sheets
+;;;     turned horizontal, to avoid seams (block name gets an _HT suffix)
+;;;
+;;; Input: sizes are in drawing units; type ' for feet and " for inches
+;;; (8'  8'6"  8'-6"  96") in any drawing, including decimal and metric.
 ;;;
 ;;; Defaults are in inches and scale automatically from INSUNITS
 ;;; (mm, cm, m, ft handled).  Parameters:
@@ -38,6 +53,7 @@
 ;;;   HWFLAT_48x96_Cxxxxx changed lumber/skin sizes; the 5-character code is
 ;;;                       built from those sizes, so each combination gets
 ;;;                       its own block and is reused only when it matches
+;;;   ..._HT              top row of skin run horizontally
 ;;;
 ;;; Housekeeping:
 ;;;   - the block is always built in the World UCS so its geometry is
@@ -84,15 +100,20 @@
           n (/ n 36)))
   s)
 
-(defun hf:name (w h p / uf nm)
+(defun hf:name (w h p ht / uf nm)
   (setq uf (hf:uf)
         nm (strcat "HWFLAT_" (rtos w 2 2) "x" (rtos h 2 2)))
-  (if (hf:samep p (hf:defaults uf))
-    nm
-    (strcat nm "_C"
-            (hf:b36 (hf:hash (apply 'strcat
-                                    (mapcar '(lambda (v) (strcat (rtos (/ v uf) 2 4) ","))
-                                            p)))))))
+  (if (not (hf:samep p (hf:defaults uf)))
+    (setq nm (strcat nm "_C"
+                     (hf:b36 (hf:hash (apply 'strcat
+                                             (mapcar '(lambda (v) (strcat (rtos (/ v uf) 2 4) ","))
+                                                     p)))))))
+  (if ht (strcat nm "_HT") nm))
+
+;; Height of the leftover top row of skin (0 if the sheets fit exactly).
+(defun hf:toprow (h sh / r)
+  (setq r (- h (* sh (fix (/ h sh)))))
+  (if (or (< r 0.001) (> r (- sh 0.001))) 0.0 r))
 
 ;; ---------- setup / restore (UCS, sysvars, layers, undo) ----------
 
@@ -181,11 +202,11 @@
         (T nil)))
 
 ;; Build the block definition if it does not exist yet. Returns block name.
-;; P is the parameter list (see hf:defaults).
-(defun hf:make (w h p / fw fd st ms xm mw md zm sw sh
-                        nm e0 ssf ssa zc xc spans sp x0 x1 big th td x z)
+;; P is the parameter list (see hf:defaults). HT = top skin row horizontal.
+(defun hf:make (w h p ht / fw fd st ms xm mw md zm sw sh
+                        nm e0 ssa zc xc spans sp x0 x1 big th td x z rh pw)
   (mapcar 'set '(fw fd st ms xm mw md zm sw sh) p)
-  (setq nm (hf:name w h p))
+  (setq nm (hf:name w h p ht))
   (if (not (tblsearch "BLOCK" nm))
     (progn
       (setq e0 (entlast))
@@ -216,18 +237,21 @@
                      (<= (+ zc (/ th 2.0)) (- h (* 2 fw))))
               (hf:box x0 st (- zc (/ th 2.0)) (- x1 x0) td th)
               (setq zc (+ zc ms))))))
-      (setq ssf (hf:since e0))
-      (command "._UNION" ssf "")
+      ;; every board stays its own solid (no UNION)
       ;; ---- skin ----
       (hf:layer "HFLAT-SKIN" 54)
-      ;; sliced into sw x sh sheets (4x8) starting at the bottom-left corner
-      (setq x 0.0)
-      (while (< x (- w 0.001))
-        (setq z 0.0)
-        (while (< z (- h 0.001))
-          (hf:box x 0 z (min sw (- w x)) st (min sh (- h z)))
-          (setq z (+ z sh)))
-        (setq x (+ x sw)))
+      ;; sliced into sw x sh sheets (4x8, running vertically) starting at the
+      ;; bottom-left corner, one row at a time.  With HT set, a short top row
+      ;; is cut from sheets turned horizontal (sh wide) to avoid extra seams.
+      (setq z 0.0)
+      (while (< z (- h 0.001))
+        (setq rh (min sh (- h z))
+              pw (if (and ht (< rh (- sh 0.001))) sh sw)
+              x  0.0)
+        (while (< x (- w 0.001))
+          (hf:box x 0 z (min pw (- w x)) st rh)
+          (setq x (+ x pw)))
+        (setq z (+ z sh)))
       ;; ---- block ----
       (setq ssa (hf:since e0))
       (command "._BLOCK" nm "0,0,0" ssa "")))
@@ -235,17 +259,47 @@
 
 ;; ---------- input ----------
 
-;; Distance prompt; rejects zero and negative values.
-(defun hf:getnum (msg def / v)
-  (initget 6)
-  (setq v (getdist (strcat "\n" msg " <" (rtos def 2 3) ">: ")))
-  (if v v def))
+;; Parse typed feet/inches such as 8'  8'6  8'-6"  8' 6.5"  96"
+;; into drawing units. Returns nil if the text isn't a length.
+(defun hf:num (s)
+  (cond ((= s "") 0.0)
+        ((distof s 2))
+        ((distof s 4))                   ; fractions, e.g. 6-1/2 or 6 1/2
+        ((distof s 5))))
+
+(defun hf:parselen (s / i ft in)
+  (setq s (vl-string-trim " " s))
+  (cond
+    ((setq i (vl-string-search "'" s))          ; feet, optional inches after
+     (setq ft (hf:num (vl-string-trim " " (substr s 1 i)))
+           in (hf:num (vl-string-trim " -\"" (substr s (+ i 2)))))
+     (if (and ft in) (* (+ (* 12.0 ft) in) (hf:uf))))
+    ((wcmatch s "*\"")                          ; inches only, e.g. 96"
+     (if (setq in (hf:num (vl-string-trim " \"" s)))
+       (* in (hf:uf))))))
+
+;; Distance prompt. Accepts a number in drawing units, two picked points,
+;; or feet/inches typed with ' and " (8' or 8'6"). Rejects zero/negative.
+(defun hf:getnum (msg def / v r again)
+  (setq again T)
+  (while again
+    (initget 134)                                ; no zero, no negative, allow text
+    (setq v (getdist (strcat "\n" msg " <" (rtos def) ">: ")))
+    (cond ((null v) (setq r def again nil))
+          ((numberp v) (setq r v again nil))
+          ((setq r (hf:parselen v))
+           (if (> r 0)
+             (setq again nil)
+             (princ "\nValue must be greater than zero.")))
+          (T (princ "\nEnter a number, or feet and inches like 8' or 8'6\"."))))
+  r)
 
 ;; ---------- commands ----------
 
-(defun c:HFLAT ( / *error* uf w h p adv msg nm)
+(defun c:HFLAT ( / *error* uf w h p adv msg nm r ht)
   (*push-error-using-command*)
   (setq *error* hf:err)
+  (princ "\nTip: type ' after a number for feet, e.g. 8' or 8'6\".")
   (setq uf (hf:uf)
         w  (hf:getnum "Flat width"  (* 48.0 uf))
         h  (hf:getnum "Flat height" (* 96.0 uf))
@@ -267,8 +321,17 @@
   (if (setq msg (hf:check w h p))
     (alert msg)
     (progn
+      ;; short top row of skin on a flat wider than one sheet: offer to run
+      ;; the top sheet(s) horizontally so the top row has fewer seams
+      (setq r (hf:toprow h (nth 9 p)))
+      (if (and (> r 0) (< r (nth 8 p)) (> w (+ (nth 8 p) 0.001)))
+        (progn
+          (initget "Yes No")
+          (setq ht (/= "No" (getkword (strcat "\nTop row of skin is only " (rtos r)
+                                              " tall. Run the top sheet(s) horizontally"
+                                              " to avoid a seam? [Yes/No] <Yes>: "))))))
       (hf:begin)
-      (setq nm (hf:make w h p))
+      (setq nm (hf:make w h p ht))
       (hf:restore)                       ; back to the user's UCS before inserting
       (setvar "CMDECHO" 1)
       (command "._-INSERT" nm "_S" 1 "_R" 0 pause)
@@ -288,7 +351,7 @@
     (alert msg)
     (progn
       (hf:begin)
-      (foreach w widths (hf:make w h p))
+      (foreach w widths (hf:make w h p nil))
       (hf:restore)
       (hf:finish)
       (princ "\nStandard flat blocks created (insert with INSERT).")))
