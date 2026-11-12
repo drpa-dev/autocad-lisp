@@ -1,0 +1,18 @@
+# AutoCAD backup / temp / lock files
+*.bak
+*.dwl
+*.dwl2
+*.sv$
+*.ac$
+*.tmp
+*.err
+plot.log
+*.log
+
+# Compiled LISP (rebuild from .lsp source)
+*.fas
+*.vlx
+
+# Windows
+Thumbs.db
+desktop.ini
