@@ -51,9 +51,10 @@ Follow the patterns in `LISPs/HFLAT.lsp`:
   reject zero/negative values. Scale defaults from INSUNITS.
 - Use `._` / `_` prefixes on commands and options so routines work in
   non-English AutoCAD.
-- Prefer plain AutoLISP and `vl-` string/list functions; avoid
-  `vla-`/`vlax-` (ActiveX) unless needed, since AutoCAD LT doesn't
-  support them.
+- Target: full AutoCAD on Windows only (no LT, no Mac). ActiveX
+  `vla-`/`vlax-`/`vlr-` functions are fine to use where they make a
+  routine simpler or more capable (e.g. dynamic block properties, block
+  descriptions); call `(vl-load-com)` once at the top of the file.
 
 ## Theatre construction notes
 
