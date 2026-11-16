@@ -24,8 +24,17 @@
 ;;;   KERFCALC  - same questions as KERFBEND, only prints the plan
 ;;;   KERFHELP  - short help text
 ;;;
-;;; UNITS: works in inches or millimetres. Just be consistent.
-;;;   Defaults are inch values in imperial drawings, mm in metric ones.
+;;; UNITS: sizes are in drawing units; you can also type ' for feet and
+;;;   " for inches (3/4"  8'  8'6"  8'-6"  96") in any drawing, including
+;;;   decimal and metric. Defaults are in inches and scale automatically
+;;;   from INSUNITS (mm, cm, m, ft handled).
+;;;
+;;; HOUSEKEEPING:
+;;;   - each command is one UNDO step; built in the World UCS, and your
+;;;     UCS, layer, snaps and dimension scale are put back afterwards
+;;;   - KERF layers (and your curve's layer, for KERFPATH) may be frozen
+;;;     or locked; they are thawed/unlocked while drawing and put back
+;;;   - Esc or an error puts everything back the same way
 ;;;
 ;;; THE MATH (simple bending model):
 ;;;   d  = kerf depth          = thickness - web
@@ -47,29 +56,69 @@
 ;;; --------------------------------------------------------------------
 ;;; Remembered answers (kept between runs in the same drawing session)
 ;;; --------------------------------------------------------------------
-(defun kb:defaults (/ lst)
-  (setq lst
-    (if (= (getvar "MEASUREMENT") 1)
-      ;; metric (mm)
-      '((*kb:th* . 18.0) (*kb:web* . 2.0) (*kb:kerf* . 3.0)
-        (*kb:rad* . 150.0) (*kb:ang* . 90.0) (*kb:wid* . 300.0)
-        (*kb:l1* . 150.0) (*kb:l2* . 150.0))
-      ;; imperial (inches)
-      '((*kb:th* . 0.75) (*kb:web* . 0.0625) (*kb:kerf* . 0.125)
-        (*kb:rad* . 6.0) (*kb:ang* . 90.0) (*kb:wid* . 12.0)
-        (*kb:l1* . 6.0) (*kb:l2* . 6.0))))
-  (foreach pair lst
-    (if (null (eval (car pair))) (set (car pair) (cdr pair))))
+;; Drawing units per inch, from INSUNITS (mm, cm, m, ft handled)
+(defun kb:uf ( / u)
+  (setq u (getvar "INSUNITS"))
+  (cond ((= u 4) 25.4)
+        ((= u 5) 2.54)
+        ((= u 6) 0.0254)
+        ((= u 2) (/ 1.0 12.0))
+        (T 1.0))
+)
+
+;; Defaults are in inches, scaled to the drawing's units. Values you
+;; type are remembered for the next run in the same drawing session.
+(defun kb:defaults (/ uf)
+  (setq uf (kb:uf))
+  (foreach pair '((*kb:th* . 0.75) (*kb:web* . 0.0625) (*kb:kerf* . 0.125)
+                  (*kb:rad* . 6.0) (*kb:wid* . 12.0) (*kb:l1* . 6.0) (*kb:l2* . 6.0))
+    (if (null (eval (car pair))) (set (car pair) (* uf (cdr pair)))))
+  (if (null *kb:ang*) (setq *kb:ang* 90.0))
   (if (null *kb:rtype*) (setq *kb:rtype* "Inside"))
 )
 
 ;;; --------------------------------------------------------------------
 ;;; Input helpers (press Enter to keep the value shown in < >)
 ;;; --------------------------------------------------------------------
-(defun kb:getlen (msg def bits / v)
-  (initget bits)
-  (setq v (getdist (strcat "\n" msg " <" (rtos def) ">: ")))
-  (if v v def)
+
+;; Parse typed feet/inches such as 8'  8'6  8'-6"  8' 6.5"  3/4"  96"
+;; into drawing units. Returns nil if the text isn't a length.
+(defun kb:num (s)
+  (cond ((= s "") 0.0)
+        ((distof s 2))
+        ((distof s 4))                   ; fractions, e.g. 6-1/2 or 6 1/2
+        ((distof s 5)))
+)
+
+(defun kb:parselen (s / i ft in)
+  (setq s (vl-string-trim " " s))
+  (cond
+    ((setq i (vl-string-search "'" s))          ; feet, optional inches after
+     (setq ft (kb:num (vl-string-trim " " (substr s 1 i)))
+           in (kb:num (vl-string-trim " -\"" (substr s (+ i 2)))))
+     (if (and ft in) (* (+ (* 12.0 ft) in) (kb:uf))))
+    ((wcmatch s "*\"")                          ; inches only, e.g. 96" or 3/4"
+     (if (setq in (kb:num (vl-string-trim " \"" s)))
+       (* in (kb:uf)))))
+)
+
+;; Distance prompt. Accepts a number in drawing units, two picked points,
+;; or feet/inches typed with ' and " (8', 8'6", 3/4") in any drawing.
+;; bits 6 = must be more than zero, bits 4 = zero allowed, no negatives.
+(defun kb:getlen (msg def bits / v r again zero)
+  (setq again T zero (= bits 4))
+  (while again
+    (initget (+ 128 bits))                      ; 128 = also allow typed text
+    (setq v (getdist (strcat "\n" msg " <" (rtos def) ">: ")))
+    (cond ((null v) (setq r def again nil))
+          ((numberp v) (setq r v again nil))
+          ((setq r (kb:parselen v))
+           (if (or (> r 0) (and zero (= r 0)))
+             (setq again nil)
+             (princ (if zero "\nValue can't be negative."
+                             "\nValue must be greater than zero."))))
+          (T (princ "\nEnter a number, or feet and inches like 8' or 8'6\" or 3/4\"."))))
+  r
 )
 
 (defun kb:getnum (msg def bits / v)
@@ -244,11 +293,24 @@
     (vla-get-ModelSpace kb:doc))
 )
 
+;; Create a layer, or if it already exists and is frozen or locked,
+;; thaw/unlock it for now. kb:restore puts it back afterwards.
 (defun kb:layer (name col lt)
-  (if (not (tblsearch "LAYER" name))
+  (if (tblsearch "LAYER" name)
+    (kb:freeup name)
     (entmake (list '(0 . "LAYER") '(100 . "AcDbSymbolTableRecord")
                    '(100 . "AcDbLayerTableRecord") (cons 2 name) '(70 . 0)
                    (cons 62 col) (cons 6 lt))))
+)
+
+(defun kb:freeup (name / fl)
+  (setq fl (cdr (assoc 70 (tblsearch "LAYER" name))))
+  (if (and fl (= 1 (logand 1 fl)) (not (member name *kb:frz*)))
+    (progn (command "._-LAYER" "_T" name "")
+           (setq *kb:frz* (cons name *kb:frz*))))
+  (if (and fl (= 4 (logand 4 fl)) (not (member name *kb:lck*)))
+    (progn (command "._-LAYER" "_U" name "")
+           (setq *kb:lck* (cons name *kb:lck*))))
 )
 
 (defun kb:loadlt (name / f)
@@ -320,19 +382,14 @@
   (vl-cmdf "_.DIMLINEAR" "_non" (kb:abs p1) "_non" (kb:abs p2) "_non" (kb:abs p3))
 )
 
-;; Switch to World UCS and size dimensions to the drawing
+;; Size dimensions to the drawing (DIMSCALE is put back by kb:restore)
 (defun kb:dimstart (txth / dt)
-  (command-s "_.UCS" "_W")
-  (setq kb:ucsset T)
   (setq dt (getvar "DIMTXT"))
   (if (> dt 0) (vl-catch-all-apply 'setvar (list "DIMSCALE" (/ txth dt))))
   (setvar "CLAYER" "KERF-DIMS")
 )
 
-(defun kb:dimend ()
-  (command-s "_.UCS" "_P")
-  (setq kb:ucsset nil)
-)
+(defun kb:dimend () (princ))
 
 ;; Remove a vertex when it sits on top of the next one (zero-length legs)
 (defun kb:dedupe (pts buls / out ob i np)
@@ -437,25 +494,62 @@
 ;;; --------------------------------------------------------------------
 ;;; Start / finish (save and restore settings, one UNDO step)
 ;;; --------------------------------------------------------------------
-(defun kb:start ()
-  (setq kb:oldvars
-    (mapcar '(lambda (v) (cons v (getvar v)))
-            '("OSMODE" "CMDECHO" "CLAYER" "DIMSCALE")))
-  (vla-StartUndoMark kb:doc)
-  (setq kb:started T)
-  (setvar "OSMODE" 0)
-  (setvar "CMDECHO" 0)
+(defun kb:old (v) (cdr (assoc v *kb:vars*)))
+
+;; Clear the bookkeeping. Called at the very start of every command.
+(defun kb:reset ()
+  (setq *kb:vars* nil *kb:frz* nil *kb:lck* nil *kb:ucs* nil *kb:undo* nil
+        *kb:hidden* nil)
 )
 
+;; Save settings, start one UNDO step, snaps off, World UCS.
+(defun kb:start ( / ctl)
+  (kb:reset)
+  (foreach v '("CMDECHO" "OSMODE" "3DOSMODE" "CLAYER" "DIMSCALE")
+    (if (getvar v) (setq *kb:vars* (cons (cons v (getvar v)) *kb:vars*))))
+  (setvar "CMDECHO" 0)
+  ;; group everything into one UNDO step (only if UNDO is fully enabled)
+  (setq ctl (getvar "UNDOCTL"))
+  (if (= 1 (logand ctl 3))
+    (progn (command "._UNDO" "_BE") (setq *kb:undo* T)))
+  (setvar "OSMODE" 0)
+  (if (getvar "3DOSMODE") (setvar "3DOSMODE" 0))
+  ;; build in World so dimensions line up; your UCS comes back at the end
+  (command "._UCS" "_W")
+  (setq *kb:ucs* T)
+)
+
+;; Put back the user's UCS, layer, layer states and settings.
+;; Safe to call more than once.
+(defun kb:restore ()
+  (if *kb:ucs*
+    (progn (command "._UCS" "_P") (setq *kb:ucs* nil)))
+  (if (kb:old "CLAYER") (setvar "CLAYER" (kb:old "CLAYER")))
+  ;; remember which KERF layers go back to frozen, to tell the user
+  (setq *kb:hidden* (vl-remove-if-not '(lambda (n) (wcmatch (strcase n) "KERF-*")) *kb:frz*))
+  (foreach nm *kb:frz* (command "._-LAYER" "_F" nm ""))
+  (foreach nm *kb:lck* (command "._-LAYER" "_LO" nm ""))
+  (setq *kb:frz* nil *kb:lck* nil)
+  (foreach v '("OSMODE" "3DOSMODE" "DIMSCALE")
+    (if (kb:old v) (vl-catch-all-apply 'setvar (list v (kb:old v)))))
+)
+
+;; Close the UNDO step and restore CMDECHO. Call last.
 (defun kb:finish ()
-  (if kb:ucsset
-    (progn (command-s "_.UCS" "_P") (setq kb:ucsset nil)))
-  (if kb:started
+  (if *kb:undo*
+    (progn (command "._UNDO" "_E") (setq *kb:undo* nil)))
+  (if (kb:old "CMDECHO") (setvar "CMDECHO" (kb:old "CMDECHO")))
+  (setq *kb:vars* nil)
+)
+
+;; After a normal finish: say if anything was drawn on a frozen layer
+(defun kb:hiddennote ()
+  (if *kb:hidden*
     (progn
-      (foreach v kb:oldvars
-        (vl-catch-all-apply 'setvar (list (car v) (cdr v))))
-      (vla-EndUndoMark kb:doc)
-      (setq kb:started nil)))
+      (princ (strcat "\nNOTE: layer(s) " (kb:join *kb:hidden* ", ")
+                     " were frozen, so they are frozen again and what was drawn"
+                     " on them is hidden. Thaw them in the Layer panel to see it."))
+      (setq *kb:hidden* nil)))
 )
 
 ;;; --------------------------------------------------------------------
@@ -947,6 +1041,9 @@
 (defun kb:delall (objs) (foreach o objs (vl-catch-all-apply 'vla-Delete (list o))))
 
 (defun kb:designface (e wside / obj lts mid tg ref ra rb da db keep p)
+  ;; the copy starts on your curve's layer; if that layer is locked the
+  ;; copy couldn't be moved to KERF-BEND, so unlock it for now
+  (kb:freeup (cdr (assoc 8 (entget e))))
   (setq obj (vlax-ename->vla-object e)
         lts (kb:ltscale (/ (max kb:flen *kb:wid*) 50.0)))
   (setq mid (kb:ptat e (* 0.5 kb:plen))
@@ -1055,15 +1152,23 @@
 ;;; --------------------------------------------------------------------
 ;;; Commands
 ;;; --------------------------------------------------------------------
+;; Runs if the command is cancelled (Esc) or fails: end any AutoCAD
+;; command left running, put everything back, close the UNDO step.
 (defun kb:err (msg)
+  (while (> (getvar "CMDACTIVE") 0) (command))
+  (kb:restore)
   (kb:finish)
+  (setq *kb:hidden* nil)
   (if (and msg (not (wcmatch (strcase msg) "*CANCEL*,*QUIT*,*EXIT*,*BREAK*")))
     (princ (strcat "\nKerf bend error: " msg)))
   (princ)
 )
 
 (defun c:KERFBEND (/ *error* bp)
-  (setq *error* kb:err kb:started nil kb:ucsset nil)
+  (*push-error-using-command*)
+  (setq *error* kb:err)
+  (kb:reset)
+  (princ "\nTip: sizes can be typed in feet/inches, e.g. 3/4\" or 2'6\".")
   (kb:ask)
   (kb:calc)
   (kb:print)
@@ -1071,22 +1176,33 @@
   (setq bp (trans (getpoint "\nPick the lower-left corner for the drawing: ") 1 0))
   (kb:start)
   (kb:draw bp)
+  (kb:restore)
   (kb:finish)
   (princ "\nKerf bend drawing done. Use ZOOM > Extents if you can't see it all.")
+  (kb:hiddennote)
+  (*pop-error-mode*)
   (princ)
 )
 
 (defun c:KERFCALC (/ *error*)
-  (setq *error* kb:err kb:started nil kb:ucsset nil)
+  (*push-error-using-command*)
+  (setq *error* kb:err)
+  (kb:reset)
+  (princ "\nTip: sizes can be typed in feet/inches, e.g. 3/4\" or 2'6\".")
   (kb:ask)
   (kb:calc)
   (kb:print)
+  (*pop-error-mode*)
+  (princ)
 )
 
 (defun c:KERFPATH (/ *error* es e pt cp tg wside raw tsum steps theta bp)
-  (setq *error* kb:err kb:started nil kb:ucsset nil)
+  (*push-error-using-command*)
+  (setq *error* kb:err)
+  (kb:reset)
   (kb:defaults)
   (princ "\n--- Kerf bending from an existing curve ---")
+  (princ "\nTip: sizes can be typed in feet/inches, e.g. 3/4\" or 2'6\".")
   ;; 1. pick the curve
   (setq e nil)
   (while (not e)
@@ -1152,10 +1268,13 @@
   (kb:start)
   (kb:drawinplace e wside)
   (kb:drawflat bp)
+  (kb:restore)
   (kb:finish)
   (princ "\nDone. Real bent board drawn on your curve (green), design outline dashed (cyan),")
   (princ "\nflat layout at the picked point.")
   (princ "\nUse ZOOM > Extents if you can't see it all.")
+  (kb:hiddennote)
+  (*pop-error-mode*)
   (princ)
 )
 
