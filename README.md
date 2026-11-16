@@ -2,6 +2,15 @@
 
 Custom AutoLISP (`.lsp`) routines for our AutoCAD drawings.
 
+## Routines
+
+| File | Commands | What it does |
+|---|---|---|
+| `LISPs/HFLAT.lsp` | `HFLAT`, `HFLATLIB` | Builds a 3D Hollywood flat (framing on edge plus lauan skin) as a block, or a library of standard widths. |
+| `LISPs/KerfBend.lsp` | `KERFBEND`, `KERFPATH`, `KERFCALC`, `KERFHELP` | Plans and draws kerf bending: kerf depth, count and spacing, the flat cut layout, and a preview of the bent board. `KERFPATH` works from a curve you've already drawn. |
+
+Sizes can be typed in feet and inches (`8'`, `8'6"`, `3/4"`) in any drawing.
+
 ## Loading a routine
 
 1. In AutoCAD, type `APPLOAD` and press Enter.
