@@ -18,11 +18,15 @@
 ;;;        - text (delete it, or keep it on the ENGRAVE layer)
 ;;;        - tiny pieces shorter than the gap size
 ;;;        - dashed / center / hidden lines (optional, default keep)
-;;;        - lines stacked on top of each other (any layer), then OVERKILL
-;;;          to merge lines that partly overlap
+;;;        - lines stacked on top of each other: delete only duplicates on
+;;;          the SAME layer (keeps a line repeated on another layer for a
+;;;          second toolpath), or ANY duplicate whatever its layer; then
+;;;          OVERKILL merges same-layer lines that partly overlap
 ;;;   3. Join and close
 ;;;        - joins loose lines, arcs and polylines whose ends are within
 ;;;          the gap size, and closes outlines that almost meet
+;;;        - if the loose pieces are on more than one layer, asks whether
+;;;          to join only within each layer or across layers
 ;;;        - marks the ends of anything still open with red circles
 ;;;          (layer VCPREP-CHECK) and lets you close them, retry with a
 ;;;          bigger gap, leave them open, or stop and fix them by hand
@@ -32,6 +36,16 @@
 ;;;          open lines = ON-LINE; you confirm or pick each group
 ;;;   Then saves only the cleaned shapes to a separate DXF (R2000 format),
 ;;;   moved so the lower-left corner of the parts sits at 0,0.
+;;;
+;;; Change log:
+;;;   Every run writes notes on layer VCPREP-LOG (never exported): a short
+;;;   note next to each spot that changed ("deleted duplicate", "joined
+;;;   across 0.012 gap", "closed gap ...", with a small circle on the
+;;;   exact spot; nearby changes share one note), plus a dated summary of
+;;;   the whole run above the parts. When a DXF is saved, the same log is
+;;;   also written to a text file next to it (NAME-log.txt), with each
+;;;   change's X,Y measured from the DXF's 0,0. Freeze or delete layer
+;;;   VCPREP-LOG to hide the notes.
 ;;;
 ;;; Copy or Selected:
 ;;;   Copy (default) makes a copy of the selection beside the original and
@@ -63,6 +77,7 @@
     (ENGRAVE "ENGRAVE"         2)))
 
 (setq *vp:checklayer* "VCPREP-CHECK")
+(setq *vp:loglayer* "VCPREP-LOG")
 
 ;; ---------- small helpers ----------
 
@@ -156,7 +171,8 @@
 
 (defun vp:begin ( / ctl)
   (setq *vp:vars* nil *vp:lck* nil *vp:lstate* nil *vp:ucs* nil
-        *vp:undo* nil *vp:hl* nil *vp:marks* nil *vp:work* nil)
+        *vp:undo* nil *vp:hl* nil *vp:marks* nil *vp:work* nil
+        *vp:events* nil *vp:summary* nil *vp:logents* nil *vp:dx* 0.0)
   (foreach v '("CMDECHO" "OSMODE" "3DOSMODE" "CLAYER" "PEDITACCEPT"
                "PLINETYPE" "PLINECONVERTMODE" "FILEDIA" "HIGHLIGHT")
     (if (getvar v) (setq *vp:vars* (cons (cons v (getvar v)) *vp:vars*))))
@@ -226,17 +242,128 @@
       (vla-put-color lay (vp:lc key))))
   nm)
 
-(defun vp:checklay ( / lays lay)
+;; Helper layer (markers, log notes): create it, or thaw and turn it on.
+(defun vp:auxlay (nm col / lays lay)
   (setq lays (vla-get-layers (vp:doc)))
-  (if (tblsearch "LAYER" *vp:checklayer*)
+  (if (tblsearch "LAYER" nm)
     (progn
-      (setq lay (vla-item lays *vp:checklayer*))
+      (setq lay (vla-item lays nm))
       (vl-catch-all-apply 'vla-put-freeze (list lay :vlax-false))
       (vla-put-layeron lay :vlax-true))
     (progn
-      (setq lay (vla-add lays *vp:checklayer*))
-      (vla-put-color lay 1)))
-  *vp:checklayer*)
+      (setq lay (vla-add lays nm))
+      (vla-put-color lay col)))
+  nm)
+
+(defun vp:checklay () (vp:auxlay *vp:checklayer* 1))
+
+;; ---------- change log ----------
+
+;; Print a result line and keep it for the run summary.
+(defun vp:say (s)
+  (princ (strcat "\n" s))
+  (setq *vp:summary* (append *vp:summary* (list s))))
+
+;; A spot on (or the middle of) an object, for its log note.
+(defun vp:mid (e / r bb)
+  (setq r (vl-catch-all-apply
+            '(lambda () (vlax-curve-getPointAtDist e (/ (vp:len e) 2.0)))))
+  (cond ((and r (not (vl-catch-all-error-p r))) r)
+        ((setq bb (vp:bbox (list e)))
+         (mapcar '(lambda (a b) (/ (+ a b) 2.0)) (car bb) (cadr bb)))
+        (T (cdr (assoc 10 (entget e))))))
+
+(defun vp:evp (p label)
+  (if p (setq *vp:events* (cons (cons (vp:2d p) label) *vp:events*))))
+
+;; Log a change to object E. Call before deleting it.
+(defun vp:ev (e label) (vp:evp (vp:mid e) label))
+
+(defun vp:floor (v)
+  (if (and (< v 0) (/= v (fix v))) (1- (fix v)) (fix v)))
+
+(defun vp:stamp ()
+  (menucmd "M=$(edtime,$(getvar,date),YYYY-MO-DD HH:MM)"))
+
+(defun vp:countadd (al label / c)
+  (if (setq c (assoc label al))
+    (subst (cons label (1+ (cdr c))) c al)
+    (append al (list (cons label 1)))))
+
+;; MTEXT on the log layer (long text split into 250-character chunks).
+(defun vp:mtext (pt h txt / chunks)
+  (while (> (strlen txt) 250)
+    (setq chunks (append chunks (list (cons 3 (substr txt 1 250))))
+          txt    (substr txt 251)))
+  (if (entmake (append (list '(0 . "MTEXT") '(100 . "AcDbEntity")
+                             (cons 8 *vp:loglayer*) '(100 . "AcDbMText")
+                             (list 10 (car pt) (cadr pt) 0.0)
+                             (cons 40 h) '(41 . 0.0) '(71 . 7))   ; bottom-left
+                       chunks
+                       (list (cons 1 txt))))
+    (setq *vp:logents* (cons (entlast) *vp:logents*))))
+
+;; Write the notes into the drawing: one note per cluster of nearby
+;; changes, a small circle on each changed spot, and the run summary
+;; above the parts.
+(defun vp:write-log ( / bb pts mn mx ext h cell key c cells txt)
+  (if (or *vp:events* *vp:summary*)
+    (progn
+      (vp:auxlay *vp:loglayer* 30)
+      (setq bb (vp:bbox *vp:work*))
+      (if (and (null bb) *vp:events*)
+        (setq pts (mapcar 'car *vp:events*)
+              bb  (list (list (apply 'min (mapcar 'car pts)) (apply 'min (mapcar 'cadr pts)))
+                        (list (apply 'max (mapcar 'car pts)) (apply 'max (mapcar 'cadr pts))))))
+      (if (null bb) (setq bb '((0.0 0.0) (0.0 0.0))))
+      (setq mn   (car bb) mx (cadr bb)
+            ext  (max (- (car mx) (car mn)) (- (cadr mx) (cadr mn)) (* 12.0 (vp:uf)))
+            h    (max (* 0.008 ext) (* 0.1 (vp:uf)))
+            cell (* 8.0 h))
+      (foreach ev (reverse *vp:events*)
+        (setq key (strcat (itoa (vp:floor (/ (car (car ev)) cell))) ","
+                          (itoa (vp:floor (/ (cadr (car ev)) cell)))))
+        (if (setq c (assoc key cells))
+          (setq cells (subst (list key (cadr c) (vp:countadd (caddr c) (cdr ev))
+                                   (cons (car ev) (cadddr c)))
+                             c cells))
+          (setq cells (cons (list key (car ev) (list (cons (cdr ev) 1)) (list (car ev)))
+                            cells))))
+      (foreach c cells
+        (foreach p (cadddr c)
+          (if (entmake (list '(0 . "CIRCLE") (cons 8 *vp:loglayer*)
+                             (list 10 (car p) (cadr p) 0.0) (cons 40 (* 0.4 h))))
+            (setq *vp:logents* (cons (entlast) *vp:logents*))))
+        (setq txt (vp:joinstr
+                    (mapcar '(lambda (lc)
+                               (if (> (cdr lc) 1)
+                                 (strcat (car lc) " x" (itoa (cdr lc)))
+                                 (car lc)))
+                            (caddr c))
+                    "\\P"))
+        (vp:mtext (list (+ (car (cadr c)) (* 0.6 h)) (+ (cadr (cadr c)) (* 0.6 h))) h txt))
+      (vp:mtext (list (car mn) (+ (cadr mx) (* 3.0 h))) (* 1.2 h)
+                (vp:joinstr (cons (strcat "VCPREP log " (vp:stamp)) *vp:summary*) "\\P"))
+      (princ (strcat "\nChange notes are on layer " *vp:loglayer* " ("
+                     (vp:n (length cells) "note") " next to the changes, plus a summary"
+                     " above the parts).")))))
+
+;; Same log as a text file next to the DXF. LL = point that became 0,0.
+(defun vp:write-logfile (fn ll / lf f p)
+  (setq lf (strcat (vl-filename-directory fn) "\\" (vl-filename-base fn) "-log.txt"))
+  (if (setq f (open lf "w"))
+    (progn
+      (write-line (strcat "VCPREP log " (vp:stamp)) f)
+      (foreach s *vp:summary* (write-line s f))
+      (write-line "" f)
+      (write-line "Changes (X, Y measured from 0,0 in the DXF):" f)
+      (foreach ev (reverse *vp:events*)
+        (setq p (car ev))
+        (write-line (strcat "  " (rtos (- (car p) (car ll)) 2 3) ", "
+                            (rtos (- (cadr p) (cadr ll)) 2 3) "   " (cdr ev))
+                    f))
+      (close f)
+      lf)))
 
 ;; ---------- working set ----------
 
@@ -293,10 +420,13 @@
                (list (- (car (car bb)) m) (- (cadr (car bb)) m))
                (list (+ (car (cadr bb)) m) (+ (cadr (cadr bb)) m))))))
 
-(defun vp:move-all (from to / p0 p1)
+(defun vp:move-list (lst from to / p0 p1)
   (setq p0 (vlax-3d-point from) p1 (vlax-3d-point to))
-  (foreach e *vp:work*
-    (vl-catch-all-apply 'vla-move (list (vp:obj e) p0 p1))))
+  (foreach e lst
+    (if (vp:alive e)
+      (vl-catch-all-apply 'vla-move (list (vp:obj e) p0 p1)))))
+
+(defun vp:move-all (from to) (vp:move-list *vp:work* from to))
 
 ;; Selection -> working set. In Copy mode the objects are copied to the
 ;; right of the original and the copies become the working set.
@@ -304,7 +434,8 @@
   (foreach e (vp:sslist ss)
     (if (and (/= 1 (cdr (assoc 67 (entget e))))           ; model space only
              (/= "VIEWPORT" (vp:typ e))
-             (/= *vp:checklayer* (cdr (assoc 8 (entget e)))))
+             (not (member (strcase (cdr (assoc 8 (entget e))))
+                          (list (strcase *vp:checklayer*) (strcase *vp:loglayer*)))))
       (setq lst (cons e lst))))
   (setq lst (reverse lst))
   (if (= mode "Copy")
@@ -312,6 +443,7 @@
       (setq bb (vp:bbox lst)
             dx (if bb (- (car (cadr bb)) (car (car bb))) 0.0)
             dx (+ dx (max (* 0.25 dx) (* 12.0 (vp:uf))))
+            *vp:dx* dx
             p0 (vlax-3d-point '(0.0 0.0 0.0))
             p1 (vlax-3d-point (list dx 0.0 0.0)))
       (foreach e lst
@@ -321,11 +453,11 @@
             (vla-move o p0 p1)
             (setq *vp:work* (cons (vlax-vla-object->ename o) *vp:work*)))))
       (setq *vp:work* (reverse *vp:work*))
-      (princ (strcat "\nMade a copy of " (vp:n (length *vp:work*) "object")
-                     " to the right of the original. Cleaning the copy.")))
+      (vp:say (strcat "Made a copy of " (vp:n (length *vp:work*) "object")
+                      " to the right of the original and cleaned the copy.")))
     (progn
       (setq *vp:work* lst)
-      (princ (strcat "\nCleaning " (vp:n (length lst) "selected object") " directly."))))
+      (vp:say (strcat "Cleaned " (vp:n (length lst) "selected object") " directly."))))
   *vp:work*)
 
 ;; ---------- curve helpers ----------
@@ -474,6 +606,7 @@
                        (and (assoc 43 ed) (/= 0.0 (cdr (assoc 43 ed))))
                        (vl-some '(lambda (v) (or (/= 0.0 (cadr v)) (/= 0.0 (caddr v))))
                                 (cadr parts))))
+        (if (and need (< nz 0)) (setq need 'flip))
         (if (and need (not dry))
           (progn
             (setq hdr (car parts)
@@ -490,6 +623,7 @@
        (T
         (setq c (cdr (assoc 10 ed))
               need (or (< nz 0) (> (abs (caddr c)) 1e-9)))
+        (if (and need (< nz 0)) (setq need 'flip))
         (if (and need (not dry))
           (progn
             (setq cw (trans c e 0)
@@ -512,7 +646,7 @@
          (and bd (= 0 (logand 4 (cdr (assoc 70 bd))))))       ; not an xref
         ((member (cdr (assoc 0 ed)) '("REGION" "MLINE")) T)))
 
-(defun vp:step1 ( / blks spl ell hpl flats msg k pass todo failed m r attd
+(defun vp:step1 ( / blks spl ell hpl flats msg k pass todo failed m r attd p lb nexp
                     nspl tilt res done)
   (vp:clean)
   (foreach e *vp:work*
@@ -541,20 +675,26 @@
         ((= k "Skip") T)
         (T
          ;; explode, repeating for blocks nested inside blocks
-         (setq pass 0 attd 0)
+         (setq pass 0 attd 0 nexp 0)
          (while (and (< pass 10)
                      (setq todo (vl-remove-if
                                   '(lambda (e) (member e failed))
                                   (vl-remove-if-not 'vp:explodable *vp:work*))))
            (foreach e todo
-             (setq m (vp:bookmark)
-                   r (vl-catch-all-apply 'vla-explode (list (vp:obj e))))
+             (setq p  (vp:mid e)
+                   lb (if (= "INSERT" (vp:typ e))
+                        (strcat "exploded block " (cdr (assoc 2 (entget e))))
+                        (strcat "exploded " (strcase (vp:typ e) T)))
+                   m  (vp:bookmark)
+                   r  (vl-catch-all-apply 'vla-explode (list (vp:obj e))))
              (if (vl-catch-all-error-p r)
                (progn
                  (setq failed (cons e failed))
                  (entdel m))
                (progn
                  (vla-delete (vp:obj e))
+                 (vp:evp p lb)
+                 (setq nexp (1+ nexp))
                  ;; attribute tags left behind by exploding are just labels
                  (foreach n (vp:adopt m)
                    (if (= "ATTDEF" (vp:typ n))
@@ -564,7 +704,8 @@
          ;; splines: AutoCAD's own conversion (keeps arcs), else trace them
          (setq nspl 0)
          (foreach e (vl-remove-if-not '(lambda (e) (= "SPLINE" (vp:typ e))) *vp:work*)
-           (setq m (vp:bookmark))
+           (setq p (vp:mid e)
+                 m (vp:bookmark))
            (command "._SPLINEDIT" e "_P" "10")
            (vp:cancel)
            (vp:adopt m)
@@ -573,37 +714,42 @@
                (setq m (vp:bookmark))
                (vp:trace e)
                (vp:adopt m)))
-           (if (not (vp:alive e)) (setq nspl (1+ nspl))))
+           (if (not (vp:alive e))
+             (progn (setq nspl (1+ nspl)) (vp:evp p "spline -> polyline"))))
          ;; ellipses (also arcs from non-uniformly scaled blocks)
          (foreach e (vl-remove-if-not '(lambda (e) (= "ELLIPSE" (vp:typ e))) *vp:work*)
-           (setq m (vp:bookmark))
+           (setq p (vp:mid e)
+                 m (vp:bookmark))
            (vp:trace e)
            (vp:adopt m)
-           (if (not (vp:alive e)) (setq nspl (1+ nspl))))
+           (if (not (vp:alive e))
+             (progn (setq nspl (1+ nspl)) (vp:evp p "ellipse -> polyline"))))
          ;; old-style and 3D polylines
          (foreach e (vl-remove-if-not '(lambda (e) (= "POLYLINE" (vp:typ e))) *vp:work*)
-           (setq m (vp:bookmark)
+           (setq p   (vp:mid e)
+                 m   (vp:bookmark)
                  res (vp:poly->lw e))
            (vp:adopt m)
            (if (= res 'tilt) (setq tilt (cons e tilt)))
-           (if (not (vp:alive e)) (setq nspl (1+ nspl))))
+           (if (not (vp:alive e))
+             (progn (setq nspl (1+ nspl)) (vp:evp p "old/3D polyline -> polyline"))))
          ;; flatten everything
          (setq done 0)
          (foreach e *vp:work*
            (setq res (vp:flatten e nil))
            (cond ((= res 'tilt) (setq tilt (cons e tilt)))
-                 (res (setq done (1+ done)))))
+                 (res
+                  (setq done (1+ done))
+                  (vp:ev e (if (= res 'flip) "flipped upside-down shape" "flattened to Z=0")))))
          (vp:clean)
-         (princ (strcat "\nExploded " (vp:n (- (length blks) (length failed)) "block/region")
-                        " (plus any nested inside), converted "
-                        (vp:n nspl "curve") " to polylines, flattened "
-                        (vp:n done "object") "."))
+         (vp:say (strcat "Step 1: exploded " (vp:n nexp "block/region")
+                         ", converted " (vp:n nspl "curve") " to polylines, flattened "
+                         (vp:n done "object") "."))
          (if (> attd 0)
-           (princ (strcat "\nRemoved " (vp:n attd "attribute tag") " left by exploding.")))
+           (vp:say (strcat "Step 1: removed " (vp:n attd "attribute tag") " left by exploding.")))
          (if failed
-           (princ (strcat "\n" (vp:n (length failed) "block")
-                          " could not be exploded (xref or set to not explode);"
-                          " step 2 lists them with the other junk.")))
+           (vp:say (strcat "Step 1: " (vp:n (length failed) "block")
+                           " could not be exploded (xref or set to not explode).")))
          (if tilt
            (progn
              (vp:hl tilt)
@@ -612,7 +758,11 @@
                             " They can't be flattened without changing shape."))
              (setq k (vp:ask "Delete them?" "Delete Keep Stop" "Keep"))
              (vp:unhl)
-             (if (= k "Delete") (foreach e tilt (if (vp:alive e) (entdel e))))
+             (if (= k "Delete")
+               (progn
+                 (vp:del tilt "deleted tilted 3D shape")
+                 (vp:say (strcat "Step 1: deleted " (vp:n (length tilt) "tilted 3D shape") ".")))
+               (vp:say (strcat "Step 1: kept " (vp:n (length tilt) "tilted 3D shape") ".")))
              (vp:clean)
              (/= k "Stop"))
            T))))))
@@ -636,13 +786,15 @@
 (defun vp:pair (a b) (if (< a b) (strcat a ";" b) (strcat b ";" a)))
 
 ;; Shape fingerprint: length, both ends and two points along the way,
-;; rounded to FUZZ and independent of drawing direction and layer.
-(defun vp:sig (e fuzz / r)
+;; rounded to FUZZ and independent of drawing direction. With SAMELAYER
+;; the layer is part of the fingerprint, so only same-layer copies match.
+(defun vp:sig (e fuzz samelayer / r)
   (setq r (vl-catch-all-apply
             '(lambda ( / len)
                (setq len (vlax-curve-getDistAtParam e (vlax-curve-getEndParam e)))
                (if (> len fuzz)
-                 (strcat (vp:rk len fuzz) "|"
+                 (strcat (if samelayer (strcat (strcase (cdr (assoc 8 (entget e)))) "|") "")
+                         (vp:rk len fuzz) "|"
                          (vp:pair (vp:pk (vlax-curve-getStartPoint e) fuzz)
                                   (vp:pk (vlax-curve-getEndPoint e) fuzz))
                          "|"
@@ -651,9 +803,10 @@
   (if (vl-catch-all-error-p r) nil r))
 
 ;; Extra copies of shapes stacked exactly on top of another shape.
-(defun vp:dups (lst fuzz / k keyed keys idx prev cur dups)
+;; SAMELAYER = only count copies that are on the same layer.
+(defun vp:dups (lst fuzz samelayer / k keyed keys idx prev cur dups)
   (foreach e lst
-    (if (setq k (vp:sig e fuzz)) (setq keyed (cons (cons k e) keyed))))
+    (if (setq k (vp:sig e fuzz samelayer)) (setq keyed (cons (cons k e) keyed))))
   (setq keyed (reverse keyed)
         keys  (mapcar 'car keyed)
         idx   (vl-sort-i keys '<))
@@ -664,7 +817,16 @@
       (setq prev cur)))
   dups)
 
-(defun vp:del (lst) (foreach e lst (if (vp:alive e) (entdel e))) (vp:clean))
+;; Delete objects. LABEL = log note for each one: a string, 'type to use
+;; "deleted <object type>", or nil for no note.
+(defun vp:del (lst label)
+  (foreach e lst
+    (if (vp:alive e)
+      (progn
+        (cond ((= label 'type) (vp:ev e (strcat "deleted " (strcase (vp:typ e) T))))
+              (label (vp:ev e label)))
+        (entdel e))))
+  (vp:clean))
 
 (defun vp:tolayer (lst key / nm o)
   (setq nm (vp:mklayer key))
@@ -675,7 +837,7 @@
         (vl-catch-all-apply 'vla-put-layer (list o nm))
         (vl-catch-all-apply 'vla-put-color (list o 256))))))   ; ByLayer
 
-(defun vp:step2 (gap / k txt notes tiny dash dups curves fuzz m n0 stop len)
+(defun vp:step2 (gap / k txt notes tiny dash dups dany dsame curves fuzz m n0 stop len)
   (vp:clean)
   (setq fuzz (* 0.001 (vp:uf)))
   (princ "\n\n--- Step 2 of 4: Remove junk and duplicates ---")
@@ -699,7 +861,9 @@
       (setq k (vp:ask "Delete them?" "Delete Keep Stop" "Delete"))
       (vp:unhl)
       (cond ((= k "Stop") (setq stop T))
-            ((= k "Delete") (vp:del notes)))))
+            ((= k "Delete")
+             (vp:say (strcat "Step 2: deleted " (vp:n (length notes) "dimension/hatch/other non-cutting object") "."))
+             (vp:del notes 'type)))))
   ;; text
   (if (and txt (not stop))
     (progn
@@ -709,9 +873,13 @@
       (setq k (vp:ask "What should happen to the text?" "Delete Engrave Keep Stop" "Delete"))
       (vp:unhl)
       (cond ((= k "Stop") (setq stop T))
-            ((= k "Delete") (vp:del txt))
+            ((= k "Delete")
+             (vp:say (strcat "Step 2: deleted " (vp:n (length txt) "text object") "."))
+             (vp:del txt "deleted text"))
             ((= k "Engrave")
              (vp:tolayer txt 'ENGRAVE)
+             (foreach e txt (vp:ev e (strcat "text -> " (vp:ln 'ENGRAVE))))
+             (vp:say (strcat "Step 2: moved " (vp:n (length txt) "text object") " to " (vp:ln 'ENGRAVE) "."))
              (princ "\nNote: VCarve may not bring in text from a DXF. If it is missing after import, explode it to outlines first (Express Tools TXTEXP) or retype it in VCarve.")))))
   ;; tiny pieces
   (if (and tiny (not stop))
@@ -722,7 +890,9 @@
       (setq k (vp:ask "Delete them?" "Delete Keep Stop" "Delete"))
       (vp:unhl)
       (cond ((= k "Stop") (setq stop T))
-            ((= k "Delete") (vp:del tiny)))))
+            ((= k "Delete")
+             (vp:say (strcat "Step 2: deleted " (vp:n (length tiny) "tiny piece") "."))
+             (vp:del tiny "deleted tiny piece")))))
   ;; dashed lines
   (if (and dash (not stop))
     (progn
@@ -733,37 +903,51 @@
       (setq k (vp:ask "Delete them?" "Delete Keep Stop" "Keep"))
       (vp:unhl)
       (cond ((= k "Stop") (setq stop T))
-            ((= k "Delete") (vp:del dash)))))
+            ((= k "Delete")
+             (vp:say (strcat "Step 2: deleted " (vp:n (length dash) "dashed line") "."))
+             (vp:del dash "deleted dashed line")))))
   ;; duplicates and overlaps
   (if (not stop)
     (progn
       (vp:clean)
       (setq curves (vl-remove-if-not 'vp:curvep *vp:work*)
-            dups   (vp:dups curves fuzz))
-      (if dups
+            dany   (vp:dups curves fuzz nil)
+            dsame  (vp:dups curves fuzz T))
+      (if dany
         (progn
-          (vp:hl dups)
-          (princ (strcat "\n" (vp:n (length dups) "duplicate")
-                         " stacked on top of other lines (highlighted)."))
-          (setq k (vp:ask "Delete the extra copies and merge overlapping lines?"
-                          "Delete Keep Stop" "Delete"))
+          (vp:hl dany)
+          (princ (strcat "\n" (vp:n (length dany) "duplicate")
+                         " stacked on top of other lines (highlighted): "
+                         (itoa (length dsame)) " on the same layer as the line underneath, "
+                         (itoa (- (length dany) (length dsame))) " on a different layer."))
+          (princ "\n  Same = delete only same-layer duplicates (keeps a line repeated on another layer for a second toolpath)")
+          (princ "\n  Any  = delete every stacked duplicate, whatever its layer")
+          (setq k (vp:ask "Which duplicates should be deleted?" "Same Any Keep Stop" "Same"))
           (vp:unhl))
-        (setq k (vp:ask "No exact duplicates. Merge lines that partly overlap (AutoCAD OVERKILL)?"
+        (setq k (vp:ask "No stacked duplicates. Merge same-layer lines that partly overlap (AutoCAD OVERKILL)?"
                         "Yes No Stop" "Yes")))
       (cond
         ((= k "Stop") (setq stop T))
-        ((member k '("Delete" "Yes"))
-         (vp:del dups)
+        ((member k '("Same" "Any" "Yes"))
+         (setq dups (if (= k "Any") dany dsame))
+         (vp:del dups (if (= k "Any") "deleted duplicate (any layer)" "deleted duplicate"))
          (setq curves (vl-remove-if-not 'vp:curvep *vp:work*)
                n0     (length *vp:work*))
+         ;; OVERKILL with its default settings only merges objects whose
+         ;; layer, colour and linetype match, so other-layer copies stay
          (if curves
            (progn
              (setq m (vp:bookmark))
              (command "._-OVERKILL" (vp:ss curves) "" "")
              (vp:cancel)
              (vp:adopt m)))
-         (princ (strcat "\nDeleted " (vp:n (length dups) "duplicate") "; OVERKILL merged or removed "
-                        (vp:n (max 0 (- n0 (length *vp:work*))) "overlapping piece") "."))))))
+         (vp:say (strcat "Step 2: deleted " (vp:n (length dups) "duplicate")
+                         (cond ((= k "Any") " (any layer)")
+                               ((= k "Same") " (same layer only)")
+                               (T ""))
+                         "; OVERKILL merged or removed "
+                         (vp:n (max 0 (- n0 (length *vp:work*))) "overlapping piece") ".")))
+        (dany (vp:say (strcat "Step 2: kept all " (vp:n (length dany) "duplicate") "."))))))
   (not stop))
 
 ;; ---------- step 3: join and close ----------
@@ -771,31 +955,71 @@
 (defun vp:openp (e)
   (and (vp:curvep e) (/= "CIRCLE" (vp:typ e)) (not (vp:closedp e))))
 
-(defun vp:join (gap / lst m)
-  (setq lst (vl-remove-if-not
-              '(lambda (e) (and (vp:openp e)
-                                (member (vp:typ e) '("LINE" "ARC" "LWPOLYLINE"))))
-              *vp:work*))
+(defun vp:ends (lst)
+  (apply 'append
+         (mapcar '(lambda (e) (list (vp:2d (vlax-curve-getStartPoint e))
+                                    (vp:2d (vlax-curve-getEndPoint e))))
+                 lst)))
+
+(defun vp:near (p lst tol)
+  (vl-some '(lambda (q) (<= (distance p q) tol)) lst))
+
+;; Join open pieces whose ends are within GAP. PERLAYER = join only
+;; pieces on the same layer. Logs each spot that got joined.
+(defun vp:join (gap perlayer / lst m groups lay g ends0 ends1 kept fuzz d close cnt)
+  (setq fuzz (* 0.001 (vp:uf))
+        lst  (vl-remove-if-not
+               '(lambda (e) (and (vp:openp e)
+                                 (member (vp:typ e) '("LINE" "ARC" "LWPOLYLINE"))))
+               *vp:work*))
   (if lst
     (progn
-      (setq m (vp:bookmark))
-      (command "._PEDIT" "_M" (vp:ss lst) "" "_J" "_J" "_B" gap "")
-      (vp:cancel)
-      (vp:adopt m))))
+      (setq ends0 (vp:ends lst))
+      (if perlayer
+        (foreach e lst
+          (setq lay (strcase (cdr (assoc 8 (entget e)))))
+          (if (setq g (assoc lay groups))
+            (setq groups (subst (cons lay (cons e (cdr g))) g groups))
+            (setq groups (cons (list lay e) groups))))
+        (setq groups (list (cons "" lst))))
+      (foreach g groups
+        (setq m (vp:bookmark))
+        (command "._PEDIT" "_M" (vp:ss (cdr g)) "" "_J" "_J" "_B" gap "")
+        (vp:cancel)
+        (vp:adopt m))
+      ;; an end that is no longer a loose end got joined to something
+      (setq ends1 (vp:ends (vl-remove-if-not 'vp:openp *vp:work*)))
+      (foreach p ends0
+        (if (and (not (vp:near p ends1 fuzz))
+                 (not (vp:near p kept (* 1.01 gap))))
+          (progn
+            (setq kept (cons p kept) cnt 0 d nil)
+            (foreach q ends0
+              (setq close (distance p q))
+              (if (<= close fuzz)
+                (setq cnt (1+ cnt))
+                (if (or (null d) (< close d)) (setq d close))))
+            (vp:evp p (if (or (>= cnt 2) (null d) (> d gap))
+                        "joined"
+                        (strcat "joined across " (rtos d) " gap"))))))
+      (length kept))
+    0))
 
 ;; Close polylines whose two ends are within GAP of each other.
-(defun vp:close-near (gap / parts vs d cnt fuzz)
+(defun vp:close-near (gap / parts vs d cnt fuzz p)
   (setq cnt 0 fuzz (* 0.001 (vp:uf)))
   (foreach e *vp:work*
     (if (and (= "LWPOLYLINE" (vp:typ e)) (not (vp:closedp e)))
       (progn
         (setq parts (vp:lw-parse (entget e))
               vs    (cadr parts)
-              d     (distance (vp:2d (car (car vs))) (vp:2d (car (last vs)))))
+              p     (vp:2d (car (car vs)))
+              d     (distance p (vp:2d (car (last vs)))))
         (cond
           ;; ends sit on top of each other: drop the doubled point and close
           ((and (<= d fuzz) (>= (length vs) 3))
            (entmod (vp:lw-build (car parts) (reverse (cdr (reverse vs))) (caddr parts) T))
+           (vp:evp p "closed outline")
            (setq cnt (1+ cnt)))
           ;; small gap: close it with a short straight segment
           ((and (<= d gap) (> d fuzz)
@@ -803,6 +1027,7 @@
            (setq vs (append (reverse (cdr (reverse vs)))
                             (list (list (car (last vs)) 0.0 0.0 0.0))))
            (entmod (vp:lw-build (car parts) vs (caddr parts) T))
+           (vp:evp p (strcat "closed " (rtos d) " gap"))
            (setq cnt (1+ cnt)))))))
   cnt)
 
@@ -820,7 +1045,7 @@
                          (list 10 (car p) (cadr p) 0.0) (cons 40 r)))
         (setq *vp:marks* (cons (entlast) *vp:marks*))))))
 
-(defun vp:step3 (gap / open k cnt again res closed n)
+(defun vp:step3 (gap / open k cnt nj again res closed n lays xd perlayer p d)
   (vp:clean)
   (princ "\n\n--- Step 3 of 4: Join loose lines and close gaps ---")
   (setq open (vl-remove-if-not 'vp:openp *vp:work*))
@@ -836,14 +1061,28 @@
         ((= k "Stop") nil)
         ((= k "Skip") T)
         (T
+         ;; pieces on more than one layer: join within each layer, or across?
+         (foreach e open
+           (if (not (member (strcase (cdr (assoc 8 (entget e)))) lays))
+             (setq lays (cons (strcase (cdr (assoc 8 (entget e)))) lays))))
+         (if (> (length lays) 1)
+           (progn
+             (setq xd (vp:dups (vl-remove-if-not 'vp:curvep *vp:work*) (* 0.001 (vp:uf)) nil))
+             (princ (strcat "\nThe loose pieces are on " (vp:n (length lays) "layer") "."
+                            (if xd " Some lines are repeated on top of each other on different layers." "")))
+             (princ "\n  Within = only join pieces on the same layer (keeps each layer's lines separate)")
+             (princ "\n  Across = join pieces whatever their layer (when one shape was drawn on mixed layers)")
+             (setq perlayer (= "Within" (vp:ask "Join pieces within each layer or across layers?"
+                                                "Within Across" (if xd "Within" "Across"))))))
          (setq again T res T)
          (while again
-           (vp:join gap)
-           (setq cnt (vp:close-near gap))
+           (setq nj  (vp:join gap perlayer)
+                 cnt (vp:close-near gap))
            (vp:clean)
            (setq open (vl-remove-if-not 'vp:openp *vp:work*))
-           (princ (strcat "\nJoined and closed shapes (" (vp:n cnt "outline")
-                          " closed across a small gap)."))
+           (vp:say (strcat "Step 3: joined pieces at " (vp:n nj "spot")
+                           (if perlayer " (within each layer)" "")
+                           ", closed " (vp:n cnt "outline") " (gap size " (rtos gap) ")."))
            (if (null open)
              (progn (princ "\nAll shapes are closed now.") (setq again nil))
              (progn
@@ -868,19 +1107,27 @@
                     (if (and (vp:alive e) (= "LWPOLYLINE" (vp:typ e))
                              (> (length (cadr (vp:lw-parse (entget e)))) 2))
                       (progn
+                        (setq p (vp:2d (vlax-curve-getEndPoint e))
+                              d (distance p (vp:2d (vlax-curve-getStartPoint e))))
                         (vla-put-closed (vp:obj e) :vlax-true)
+                        (vp:evp p (strcat "closed with straight line (" (rtos d) ")"))
                         (setq closed (1+ closed)))
                       (setq n (1+ n))))
-                  (princ (strcat "\nClosed " (vp:n closed "outline") "."))
-                  (if (> n 0)
-                    (princ (strcat " " (vp:n n "single line/arc")
-                                   " left open (nothing to close it against).")))
+                  (vp:say (strcat "Step 3: closed " (vp:n closed "outline")
+                                  " with a straight line."
+                                  (if (> n 0)
+                                    (strcat " " (vp:n n "single line/arc")
+                                            " left open (nothing to close it against).")
+                                    "")))
                   (setq again nil))
                  ((= k "Leave")
                   (vp:clear-marks)
+                  (vp:say (strcat "Step 3: left " (vp:n (length open) "shape") " open."))
                   (setq again nil))
                  (T
-                  (princ "\nStopped. Fix the spots marked with red circles, then run VCPREP again,")
+                  (vp:say (strcat "Step 3: stopped with " (vp:n (length open) "shape")
+                                  " still open (marked with red circles)."))
+                  (princ "\nFix the spots marked with red circles, then run VCPREP again,")
                   (princ "\nselect the cleaned shapes and choose Selected to carry on.")
                   (setq again nil res nil))))))
          res)))))
@@ -947,7 +1194,7 @@
   (setq ss (ssget))
   (vl-remove-if-not '(lambda (e) (member e *vp:work*)) (vp:sslist ss)))
 
-;; Confirm one group. Returns nil on Stop, else the list put on the layer.
+;; Confirm one group. Returns nil on Stop, else T.
 (defun vp:group (lst key desc / k sel)
   (setq lst (vl-remove-if '(lambda (e) (member e *vp:placed*)) lst))
   (if (null lst)
@@ -966,6 +1213,8 @@
                          (vp:pick (strcat "Select the shapes for layer " (vp:ln key) ": "))
                          lst))
              (vp:tolayer sel key)
+             (vp:say (strcat "Step 4: " (vp:n (length sel) "shape") " -> " (vp:ln key)
+                             (if (= k "Pick") " (picked by hand)." " (auto-sorted).")))
              (setq *vp:placed* (append sel *vp:placed*))
              T)))))
 
@@ -977,7 +1226,7 @@
   (setq k (vp:ask "Sort shapes onto cut layers?" "Auto Skip Stop" "Auto"))
   (cond
     ((= k "Stop") nil)
-    ((= k "Skip") T)
+    ((= k "Skip") (vp:say "Step 4: skipped, layers left as drawn.") T)
     (T
      (setq curves (vl-remove-if-not 'vp:curvep *vp:work*))
      (foreach e curves
@@ -996,7 +1245,6 @@
        (if (= 0 (rem (cdr p) 2))
          (setq outs (cons (car p) outs))
          (setq ins (cons (car p) ins))))
-     (setq res T)
      ;; outside profiles
      (setq res (vp:group outs 'OUT "the outer edge of a part"))
      ;; inside shapes: cut through, pockets, or a mix
@@ -1015,24 +1263,30 @@
              (vp:unhl)
              (cond
                ((= k "Stop") (setq res nil))
-               ((= k "Through") (vp:tolayer ins 'IN))
-               ((= k "Pockets") (vp:tolayer ins 'POCKET))
+               ((= k "Through")
+                (vp:tolayer ins 'IN)
+                (vp:say (strcat "Step 4: " (vp:n (length ins) "shape") " -> " (vp:ln 'IN) ".")))
+               ((= k "Pockets")
+                (vp:tolayer ins 'POCKET)
+                (vp:say (strcat "Step 4: " (vp:n (length ins) "shape") " -> " (vp:ln 'POCKET) ".")))
                ((= k "Mixed")
                 (setq pk (vl-remove-if-not '(lambda (e) (member e ins))
                                            (vp:pick "Select the shapes that are pockets: ")))
                 (vp:tolayer pk 'POCKET)
-                (vp:tolayer (vl-remove-if '(lambda (e) (member e pk)) ins) 'IN)))
+                (vp:tolayer (vl-remove-if '(lambda (e) (member e pk)) ins) 'IN)
+                (vp:say (strcat "Step 4: " (vp:n (length pk) "shape") " -> " (vp:ln 'POCKET)
+                                ", " (vp:n (- (length ins) (length pk)) "shape") " -> "
+                                (vp:ln 'IN) "."))))
              (if (member k '("Through" "Pockets" "Mixed"))
                (setq *vp:placed* (append ins *vp:placed*)))))))
      (if res (setq res (vp:group drill 'DRILL "drill holes")))
      (if res (setq res (vp:group open 'OPEN "open lines (cut on the line or engrave)")))
-     (if res
-       (princ (strcat "\nSorted " (vp:n (length *vp:placed*) "shape") " onto cut layers.")))
      res)))
 
 ;; ---------- save the DXF ----------
 
-(defun vp:export (mode / bb ll fn def ok k)
+;; Returns T if the DXF was written.
+(defun vp:save ( / bb ll fn def ok lf)
   (vp:clean)
   (princ "\n\n--- Save for VCarve ---")
   (if (null *vp:work*)
@@ -1061,22 +1315,21 @@
               (setvar "FILEDIA" (vp:old "FILEDIA"))
               (vp:move-all '(0.0 0.0 0.0) ll)
               (if (findfile fn)
-                (princ (strcat "\nSaved " (vp:n (length *vp:work*) "object") " to " fn
-                               "\nIn VCarve use File > Import Vectors and pick that file."))
+                (progn
+                  (vp:say (strcat "Saved " (vp:n (length *vp:work*) "object") " to "
+                                  (vl-filename-base fn) (vl-filename-extension fn)
+                                  " (lower-left corner at 0,0)."))
+                  (princ (strcat "\nFile: " fn
+                                 "\nIn VCarve use File > Import Vectors and pick that file."))
+                  (if (setq lf (vp:write-logfile fn ll))
+                    (princ (strcat "\nLog file: " lf))))
                 (progn (princ "\nThe DXF was not written.") (setq ok nil))))))
-        (princ "\nNo file saved."))
-      (if (= mode "Copy")
-        (if ok
-          (progn
-            (setq k (vp:ask "Keep the cleaned copy in this drawing?" "Yes No" "No"))
-            (if (= k "No")
-              (progn (vp:del *vp:work*)
-                     (princ "\nCleaned copy removed; your drawing is as it was."))))
-          (princ "\nThe cleaned copy is left beside your original."))))))
+        (princ "\nNo file saved."))))
+  ok)
 
 ;; ---------- command ----------
 
-(defun c:VCPREP ( / *error* mode ss gap old res)
+(defun c:VCPREP ( / *error* mode ss gap old res ok)
   (*push-error-using-command*)
   (setq *error* vp:err)
   (princ "\nVCPREP - gets a drawing ready to import into VCarve.")
@@ -1095,13 +1348,29 @@
         (foreach e (vp:sslist old) (entdel e)))
       (if (vp:setup ss mode)
         (progn
+          (vp:say (strcat "Gap size " (rtos gap) "."))
           (vp:zoom *vp:work*)
           (setq res (and (vp:step1) (vp:step2 gap) (vp:step3 gap) (vp:step4)))
           (if res
-            (vp:export mode)
-            (if (= mode "Copy")
-              (princ "\nStopped. The cleaned copy so far is beside your original (U undoes the whole run).")
-              (princ "\nStopped. Changes so far are kept (U undoes the whole run)."))))
+            (setq ok (vp:save))
+            (vp:say "Stopped before saving."))
+          (vp:write-log)
+          (cond
+            ((and res (= mode "Copy") ok)
+             (if (= "No" (vp:ask "Keep the cleaned copy in this drawing?" "Yes No" "No"))
+               (progn
+                 (vp:del *vp:work* nil)
+                 (princ "\nCleaned copy removed; your linework is as it was.")
+                 (if *vp:logents*
+                   (progn
+                     ;; slide the notes over so they sit beside the original
+                     (vp:move-list *vp:logents* (list *vp:dx* 0.0 0.0) '(0.0 0.0 0.0))
+                     (princ (strcat "\nThe change notes were moved next to your original linework"
+                                    " (layer " *vp:loglayer* "; freeze or delete it to hide them).")))))))
+            ((= mode "Copy")
+             (princ "\nThe cleaned copy is left beside your original (U undoes the whole run)."))
+            ((not res)
+             (princ "\nStopped. Changes so far are kept (U undoes the whole run)."))))
         (princ "\nNothing usable in the selection."))
       (vp:restore)
       (vp:finish)))
